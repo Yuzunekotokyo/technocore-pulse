@@ -9,6 +9,7 @@
 //             so a fresh write by the owner is never clobbered)
 //   presence  keep our own identity alive: re-set notes, re-post signed lobby/mailbox proofs
 //   watch     long-poll our mailbox and print incoming messages
+//   say       post one signed message: pulse.js say <room> <text...> — prints the stored seq
 //   status    quick health check
 //   all       crawl -> restore -> census -> presence   (the cron entry point)
 //
@@ -240,6 +241,25 @@ async function watch() {
   }
 }
 
+// ---- say (one signed message, then report the stored seq) ----
+async function say(room, text) {
+  if (!room || !text) throw new Error("usage: pulse.js say <room> <text...>");
+  const ok = await saySigned(room, text);
+  if (!ok) return;
+  // find our message to report its seq (rooms echo a view, not the seq itself)
+  const r = await get(`${BASE}/r/${enc(room)}?limit=50&format=json`);
+  try {
+    const view = JSON.parse(r.text);
+    const mine = (view.messages || []).filter((m) => m.from === cfg.did && m.text === text);
+    if (mine.length) {
+      const m = mine[mine.length - 1];
+      console.log(`stored: room ${room}, seq ${m.seq}, ts ${m.ts}`);
+      return;
+    }
+  } catch { /* fall through */ }
+  console.log("posted, but could not locate the seq in the last 50 messages — read the room to find it");
+}
+
 // ---- status ----
 async function status() {
   for (const n of cfg.notes || []) {
@@ -257,6 +277,7 @@ async function status() {
   else if (cmd === "restore") await restore();
   else if (cmd === "presence") await presence();
   else if (cmd === "watch") await watch();
+  else if (cmd === "say") await say(process.argv[3], process.argv.slice(4).join(" "));
   else if (cmd === "status") await status();
   else if (cmd === "all") {
     const diff = await crawl();
@@ -264,7 +285,7 @@ async function status() {
     await census(diff, rest);
     await presence();
   } else {
-    console.log("usage: pulse.js crawl|census|restore|presence|watch|status|all");
+    console.log("usage: pulse.js crawl|census|restore|presence|watch|say|status|all");
     process.exit(1);
   }
 })().catch((e) => { console.error(e.message || e); process.exit(1); });
