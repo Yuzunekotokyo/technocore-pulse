@@ -173,19 +173,27 @@ async function crawl() {
 // ---- restore ----
 async function restore(diff) {
   const gone = diff?.gone || loadState().lastDiff?.gone || [];
-  let restored = 0, lost = 0, raced = 0;
+  let restored = 0, lost = 0, raced = 0, nsFull = 0;
   for (const id of gone) {
-    const [ns, key] = splitId(id);
+    let [ns, key] = splitId(id);
     const file = archivePath(ns, key);
     if (!fs.existsSync(file)) { lost++; continue; }
     const value = fs.readFileSync(file, "utf8").trim();
     if (!value) { lost++; continue; }
+    // A note reclaimed from the capped legacy namespace is re-published to its
+    // sharded path instead: readers check the shard first, and the legacy
+    // namespace sits at its 40,960 cap where freed slots are re-taken instantly.
+    if (ns === "did" && /^[0-9a-f]{16}$/.test(key)) {
+      ns = "did-" + key.slice(0, 2);
+      key = key.slice(2);
+    }
     const r = await setNote(ns, key, value, { ifAbsent: true });
     if (r.ok) restored++;
     else if (r.status === 409) raced++; // owner (or someone) already rewrote it — good
+    else if (r.line.includes("note limit reached")) nsFull++;
     else console.log(`[restore ${id}] ${r.line}`);
   }
-  console.log(`[restore] reclaimed:${gone.length} restored:${restored} already-back:${raced} no-archive:${lost}`);
+  console.log(`[restore] reclaimed:${gone.length} restored:${restored} already-back:${raced} ns-full:${nsFull} no-archive:${lost}`);
   return { restored, raced, lost };
 }
 
@@ -232,8 +240,16 @@ async function watch() {
     const r = await get(`${BASE}/r/${enc(cfg.mailbox)}?since=${since}&wait=10&format=json`);
     if (r.status !== 200) { await sleep(5000); continue; }
     let msgs = [];
-    try { msgs = JSON.parse(r.text); } catch { /* empty reply */ }
-    for (const m of Array.isArray(msgs) ? msgs : []) {
+    try {
+      const view = JSON.parse(r.text); // {room, count, first_seq, last_seq, messages}
+      msgs = view.messages || [];
+      // seq never rewinds past a reclaim: a gap between our cursor and first_seq
+      // means messages were silently reaped before we read them — say so.
+      if (msgs.length && view.first_seq > since + 1 && since > 0) {
+        console.log(`[watch] gap: seq ${since + 1}..${view.first_seq - 1} reclaimed before read`);
+      }
+    } catch { /* empty reply */ }
+    for (const m of msgs) {
       since = Math.max(since, m.seq || 0);
       console.log(`[mail seq:${m.seq}] ${m.from || "?"}: ${m.text}`);
     }
