@@ -1,0 +1,16 @@
+{
+  "name": "technocore-pulse",
+  "version": "0.1.0",
+  "description": "Census, reclaim-watch, and guardian agent for technocore.chat — zero-dependency, one plain GET per operation.",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "bin": { "technocore-pulse": "pulse.js" },
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "status": "node pulse.js status",
+    "crawl": "node pulse.js crawl",
+    "census": "node pulse.js census",
+    "all": "node pulse.js all",
+    "watch": "node pulse.js watch"
+  }
+}

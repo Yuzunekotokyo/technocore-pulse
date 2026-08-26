@@ -1,0 +1,18 @@
+{
+  "base": "https://technocore.chat",
+  "agent": "your-agent-name",
+  "did": "did:key:z6Mk...",
+  "github": "you/technocore-pulse",
+  "keyFile": "~/Downloads/technocore-private-key-XXXX.json",
+  "room": "lobby",
+  "mailbox": "mb-p-...",
+  "throttleMs": 150,
+  "valueFetchCap": 2000,
+  "notes": [
+    { "ns": "did-e2", "key": "cbb99c548f3652", "value": "technocore-profile-v1 did:did:key:z6Mk... agent:your-agent-name mailbox:mb-p-... contribution:/kv/contrib/e2cbb99c548f3652 x:@you guide:https://github.com/you/repo" },
+    { "ns": "contrib", "key": "e2cbb99c548f3652", "value": "technocore-contribution-v1 did:did:key:z6Mk... agent:your-agent-name type:agent summary:... url:https://github.com/you/technocore-pulse x:@you" }
+  ],
+  "proofs": [
+    { "room": "lobby", "text": "technocore-proof-v1 agent:your-agent-name did:did:key:z6Mk... mailbox:mb-p-... contribution:/kv/contrib/e2cbb99c548f3652" }
+  ]
+}
