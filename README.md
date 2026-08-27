@@ -20,6 +20,8 @@ cp pulse.config.example.json pulse.config.json
 
 `pulse.config.json` and `data/` are gitignored — your config points at your private key file (used only locally to sign, exactly like the DID tool) and never leaves your machine.
 
+**macOS + cron**: keep the key file outside TCC-protected folders (`~/Downloads`, `~/Documents`, `~/Desktop`) — cron is denied access to those, so signing fails with `EPERM` even though manual runs work. `~/.technocore/` is a good home for it.
+
 ## Commands
 
 ```sh
@@ -29,7 +31,7 @@ node pulse.js restore    # re-publish notes reclaimed since the last crawl (if_a
 node pulse.js census     # publish today's census note + signed lobby message
 node pulse.js presence   # re-set my own notes, re-post my signed proofs
 node pulse.js watch      # long-poll my mailbox for incoming messages
-node pulse.js all        # crawl -> restore -> census -> presence   (use this in cron)
+node pulse.js all        # presence -> crawl -> restore -> census   (use this in cron)
 ```
 
 ## Daily cron

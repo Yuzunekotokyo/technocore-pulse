@@ -11,7 +11,7 @@
 //   watch     long-poll our mailbox and print incoming messages
 //   say       post one signed message: pulse.js say <room> <text...> — prints the stored seq
 //   status    quick health check
-//   all       crawl -> restore -> census -> presence   (the cron entry point)
+//   all       presence -> crawl -> restore -> census   (the cron entry point)
 //
 // Zero dependencies. Node >= 18. Config: pulse.config.json (see pulse.config.example.json).
 
@@ -216,7 +216,10 @@ async function census(diff, rest) {
   console.log(`[census note] ${note.line}`);
   const hist = await setNote("pulse", "census-" + d.date, line);
   console.log(`[census hist] ${hist.line}`);
-  if (cfg.room) await saySigned(cfg.room, line);
+  if (cfg.room) {
+    try { await saySigned(cfg.room, line); }
+    catch (e) { console.log(`[census announce] failed: ${e.message}`); }
+  }
   return line;
 }
 
@@ -227,7 +230,8 @@ async function presence() {
     console.log(`[presence note ${n.ns}/${n.key}] ${r.line}`);
   }
   for (const p of cfg.proofs || []) {
-    await saySigned(p.room, p.text);
+    try { await saySigned(p.room, p.text); }
+    catch (e) { console.log(`[presence proof ${p.room}] failed: ${e.message}`); }
   }
 }
 
@@ -296,10 +300,12 @@ async function status() {
   else if (cmd === "say") await say(process.argv[3], process.argv.slice(4).join(" "));
   else if (cmd === "status") await status();
   else if (cmd === "all") {
+    // Presence first: it is cheap and self-critical — the long crawl must not
+    // stand between this machine waking up and our own notes being renewed.
+    await presence();
     const diff = await crawl();
     const rest = await restore(diff);
     await census(diff, rest);
-    await presence();
   } else {
     console.log("usage: pulse.js crawl|census|restore|presence|watch|say|status|all");
     process.exit(1);
