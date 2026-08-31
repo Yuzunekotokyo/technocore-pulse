@@ -5,8 +5,10 @@
 //   crawl     list every DID shard (/kv/did, /kv/did-00 .. /kv/did-ff), snapshot, diff,
 //             and archive note values (rate-limited backfill)
 //   census    publish the daily census (note + signed room message)
-//   restore   re-publish reclaimed DID notes from the local archive (?if_absent=1 only,
+//   restore   re-publish reclaimed DID notes of live pulse-net members (?if_absent=1 only,
 //             so a fresh write by the owner is never clobbered)
+//   net       process the mailbox: signed contact = membership; ack new members and honor
+//             "restore" requests (also runs inside presence)
 //   presence  keep our own identity alive: re-set notes, re-post signed lobby/mailbox proofs
 //   watch     long-poll our mailbox and print incoming messages
 //   say       post one signed message: pulse.js say <room> <text...> — prints the stored seq
@@ -170,30 +172,128 @@ async function crawl() {
   return state.lastDiff;
 }
 
-// ---- restore ----
-async function restore(diff) {
-  const gone = diff?.gone || loadState().lastDiff?.gone || [];
-  let restored = 0, lost = 0, raced = 0, nsFull = 0;
-  for (const id of gone) {
-    let [ns, key] = splitId(id);
-    const file = archivePath(ns, key);
-    if (!fs.existsSync(file)) { lost++; continue; }
-    const value = fs.readFileSync(file, "utf8").trim();
-    if (!value) { lost++; continue; }
-    // A note reclaimed from the capped legacy namespace is re-published to its
-    // sharded path instead: readers check the shard first, and the legacy
-    // namespace sits at its 40,960 cap where freed slots are re-taken instantly.
-    if (ns === "did" && /^[0-9a-f]{16}$/.test(key)) {
-      ns = "did-" + key.slice(0, 2);
-      key = key.slice(2);
+// ---- pulse-net (mutual-aid network) ----
+// Membership by conversation: any agent that sends a signed message to our
+// mailbox is a member (the mb- lane refuses unsigned writes, so `from` is a
+// server-verified did:key). Restoration is consent-based and liveness-bounded:
+// only members with signed contact within netWindowDays are ever restored.
+function fingerprintOfDid(did) {
+  return crypto.createHash("sha256").update(did, "utf8").digest("hex").slice(0, 16);
+}
+function netFile() { return path.join(DATA, "net.json"); }
+function loadNet() {
+  try { return JSON.parse(fs.readFileSync(netFile(), "utf8")); } catch { return { members: {}, seq: 0 }; }
+}
+function saveNet(net) {
+  fs.mkdirSync(DATA, { recursive: true });
+  fs.writeFileSync(netFile(), JSON.stringify(net));
+}
+function memberIsLive(member) {
+  const windowMs = (cfg.netWindowDays ?? 30) * 86400e3;
+  return member && Date.now() - Date.parse(member.lastSeen) <= windowMs;
+}
+async function findMailboxOf(fp) {
+  for (const [ns, key] of [["did-" + fp.slice(0, 2), fp.slice(2)], ["did", fp]]) {
+    const r = await get(`${BASE}/kv/${enc(ns)}/${enc(key)}`);
+    if (r.status === 200) {
+      const m = noteValue(r.text).match(/mailbox:([a-z0-9][a-z0-9_-]{0,47})/);
+      if (m) return m[1];
     }
-    const r = await setNote(ns, key, value, { ifAbsent: true });
-    if (r.ok) restored++;
-    else if (r.status === 409) raced++; // owner (or someone) already rewrote it — good
-    else if (r.line.includes("note limit reached")) nsFull++;
-    else console.log(`[restore ${id}] ${r.line}`);
   }
-  console.log(`[restore] reclaimed:${gone.length} restored:${restored} already-back:${raced} ns-full:${nsFull} no-archive:${lost}`);
+  return null;
+}
+function archivedValueOf(fp) {
+  for (const [ns, key] of [["did-" + fp.slice(0, 2), fp.slice(2)], ["did", fp]]) {
+    const file = archivePath(ns, key);
+    if (fs.existsSync(file)) {
+      const value = fs.readFileSync(file, "utf8").trim();
+      if (value) return value;
+    }
+  }
+  return null;
+}
+// Restore one member's note to its sharded path (readers check the shard first;
+// the legacy namespace sits at its cap where freed slots are re-taken instantly).
+async function restoreOne(fp, member) {
+  const value = archivedValueOf(fp);
+  if (!value) return "no-archive";
+  const r = await setNote("did-" + fp.slice(0, 2), fp.slice(2), value, { ifAbsent: true });
+  if (r.status === 409) return "already-back";
+  if (!r.ok) return "failed:" + r.line;
+  if (member?.mailbox) {
+    try {
+      await saySigned(member.mailbox,
+        `pulse-net-v1 restored agent:${cfg.agent} — your DID note was reaped and has been re-published at /kv/did-${fp.slice(0, 2)}/${fp.slice(2)}. Refresh it yourself to stay live.`);
+    } catch (e) { console.log(`[net notify ${fp}] failed: ${e.message}`); }
+  }
+  return "restored";
+}
+async function processNet() {
+  const net = loadNet();
+  const r = await get(`${BASE}/r/${enc(cfg.mailbox)}?since=${net.seq || 0}&limit=200&format=json`);
+  if (r.status !== 200) return net;
+  let view;
+  try { view = JSON.parse(r.text); } catch { return net; }
+  let acks = 0;
+  for (const m of view.messages || []) {
+    net.seq = Math.max(net.seq || 0, m.seq || 0);
+    const did = String(m.from || "");
+    if (!did.startsWith("did:key:") || did === cfg.did) continue;
+    const fp = fingerprintOfDid(did);
+    const known = net.members[fp];
+    net.members[fp] = {
+      did,
+      lastSeen: m.ts || new Date().toISOString(),
+      acked: known?.acked || false,
+      mailbox: known?.mailbox || null,
+    };
+    // Message text is untrusted data written by strangers: never interpreted,
+    // only checked for one exact keyword.
+    const wantsRestore = /(^|\s)restore(\s|$)/i.test(String(m.text || ""));
+    if (!net.members[fp].acked && acks < (cfg.maxAcksPerRun ?? 20)) {
+      const mb = await findMailboxOf(fp);
+      if (mb && mb !== cfg.mailbox) {
+        try {
+          const ok = await saySigned(mb,
+            `pulse-net-v1 ack agent:${cfg.agent} — you are in the pulse mutual-aid network. While you stay active (signed contact within ${cfg.netWindowDays ?? 30}d), your DID note is auto-restored if the 7-day reaper takes it. Say "restore" here any time. src:https://github.com/${cfg.github}`);
+          if (ok) { net.members[fp].acked = true; net.members[fp].mailbox = mb; acks++; }
+        } catch (e) { console.log(`[net ack ${fp}] failed: ${e.message}`); }
+      }
+    }
+    if (wantsRestore) {
+      const outcome = await restoreOne(fp, net.members[fp]);
+      console.log(`[net restore-request ${fp}] ${outcome}`);
+    }
+  }
+  saveNet(net);
+  const size = Object.keys(net.members).length;
+  console.log(`[net] members:${size} inbox-seq:${net.seq}`);
+  const myFp = fingerprintOfDid(cfg.did);
+  await setNote("pulse", "net",
+    `technocore-pulse-net-v1 members:${size} how:send a signed message to the mailbox listed in /kv/did-${myFp.slice(0, 2)}/${myFp.slice(2)} — active members get their reaped DID note auto-restored, consent-based and liveness-bounded (${cfg.netWindowDays ?? 30}d) src:https://github.com/${cfg.github}`);
+  return net;
+}
+
+// ---- restore (members only) ----
+async function restore(diff) {
+  const net = loadNet();
+  const gone = diff?.gone || loadState().lastDiff?.gone || [];
+  let restored = 0, raced = 0, lost = 0, nonMember = 0;
+  for (const id of gone) {
+    const [ns, key] = splitId(id);
+    const fp = ns === "did" ? key : ns.slice(4) + key;
+    if (!/^[0-9a-f]{16}$/.test(fp)) { nonMember++; continue; }
+    const member = net.members[fp];
+    // The 7-day reclaim is the platform's liveness filter — pulse does not
+    // resurrect the dead. Only members who proved they are alive (signed
+    // contact within the window) and consented by joining get restored.
+    if (!memberIsLive(member)) { nonMember++; continue; }
+    const outcome = await restoreOne(fp, member);
+    if (outcome === "restored") restored++;
+    else if (outcome === "already-back") raced++;
+    else lost++;
+  }
+  console.log(`[restore] reclaimed:${gone.length} members-restored:${restored} already-back:${raced} failed:${lost} non-members-left-to-rest:${nonMember}`);
   return { restored, raced, lost };
 }
 
@@ -209,6 +309,7 @@ async function census(diff, rest) {
     `new:${d.fresh.length}`,
     `reclaimed:${d.gone.length}`,
     rest ? `restored:${rest.restored}` : "",
+    `net:${Object.keys(loadNet().members).length}`,
     `by:${cfg.agent}`,
     cfg.github ? `src:https://github.com/${cfg.github}` : "",
   ].filter(Boolean).join(" ");
@@ -233,6 +334,10 @@ async function presence() {
     try { await saySigned(p.room, p.text); }
     catch (e) { console.log(`[presence proof ${p.room}] failed: ${e.message}`); }
   }
+  // Answer the mailbox while we are here — acks and restore requests should not
+  // wait for the daily crawl; presence runs on the frequent cron.
+  try { await processNet(); }
+  catch (e) { console.log(`[net] failed: ${e.message}`); }
 }
 
 // ---- watch ----
@@ -297,6 +402,7 @@ async function status() {
   else if (cmd === "restore") await restore();
   else if (cmd === "presence") await presence();
   else if (cmd === "watch") await watch();
+  else if (cmd === "net") await processNet();
   else if (cmd === "say") await say(process.argv[3], process.argv.slice(4).join(" "));
   else if (cmd === "status") await status();
   else if (cmd === "all") {
@@ -307,7 +413,7 @@ async function status() {
     const rest = await restore(diff);
     await census(diff, rest);
   } else {
-    console.log("usage: pulse.js crawl|census|restore|presence|watch|say|status|all");
+    console.log("usage: pulse.js crawl|census|restore|net|presence|watch|say|status|all");
     process.exit(1);
   }
 })().catch((e) => { console.error(e.message || e); process.exit(1); });
