@@ -196,7 +196,7 @@ async function findMailboxOf(fp) {
   for (const [ns, key] of [["did-" + fp.slice(0, 2), fp.slice(2)], ["did", fp]]) {
     const r = await get(`${BASE}/kv/${enc(ns)}/${enc(key)}`);
     if (r.status === 200) {
-      const m = noteValue(r.text).match(/mailbox:([a-z0-9][a-z0-9_-]{0,47})/);
+      const m = noteValue(r.text).match(/mailbox:\s*([a-z0-9][a-z0-9_-]{0,47})/);
       if (m) return m[1];
     }
   }
