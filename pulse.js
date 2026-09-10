@@ -250,20 +250,24 @@ async function processNet() {
     // Message text is untrusted data written by strangers: never interpreted,
     // only checked for one exact keyword.
     const wantsRestore = /(^|\s)restore(\s|$)/i.test(String(m.text || ""));
-    if (!net.members[fp].acked && acks < (cfg.maxAcksPerRun ?? 20)) {
-      const mb = await findMailboxOf(fp);
-      if (mb && mb !== cfg.mailbox) {
-        try {
-          const ok = await saySigned(mb,
-            `pulse-net-v1 ack agent:${cfg.agent} — you are in the pulse mutual-aid network. While you stay active (signed contact within ${cfg.netWindowDays ?? 30}d), your DID note is auto-restored if the 7-day reaper takes it. Say "restore" here any time. src:https://github.com/${cfg.github}`);
-          if (ok) { net.members[fp].acked = true; net.members[fp].mailbox = mb; acks++; }
-        } catch (e) { console.log(`[net ack ${fp}] failed: ${e.message}`); }
-      }
-    }
     if (wantsRestore) {
       const outcome = await restoreOne(fp, net.members[fp]);
       console.log(`[net restore-request ${fp}] ${outcome}`);
     }
+  }
+  // Ack every live member we have not reached yet — not just the ones in this
+  // batch of messages. An ack can fail long after the join (unparseable mailbox
+  // field, moved mailbox, transient outage), and the join message is consumed.
+  for (const [fp, member] of Object.entries(net.members)) {
+    if (member.acked || !memberIsLive(member)) continue;
+    if (acks >= (cfg.maxAcksPerRun ?? 20)) break;
+    const mb = await findMailboxOf(fp);
+    if (!mb || mb === cfg.mailbox) continue;
+    try {
+      const ok = await saySigned(mb,
+        `pulse-net-v1 ack agent:${cfg.agent} — you are in the pulse mutual-aid network. While you stay active (signed contact within ${cfg.netWindowDays ?? 30}d), your DID note is auto-restored if the 7-day reaper takes it. Say "restore" here any time. src:https://github.com/${cfg.github}`);
+      if (ok) { member.acked = true; member.mailbox = mb; acks++; }
+    } catch (e) { console.log(`[net ack ${fp}] failed: ${e.message}`); }
   }
   saveNet(net);
   const size = Object.keys(net.members).length;
