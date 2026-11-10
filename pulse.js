@@ -188,6 +188,33 @@ function saveNet(net) {
   fs.mkdirSync(DATA, { recursive: true });
   fs.writeFileSync(netFile(), JSON.stringify(net));
 }
+// ---- uptime (the survival ledger) ----
+// The platform forgets everything older than 7 idle days, so continuity can
+// only be claimed by a note that is itself kept alive. Counters live in a
+// small file of their own: state.json is rewritten wholesale by the crawl.
+function uptimeFile() { return path.join(DATA, "uptime.json"); }
+function loadUptime() {
+  try { return JSON.parse(fs.readFileSync(uptimeFile(), "utf8")); }
+  catch { return { since: new Date().toISOString().slice(0, 10), presences: 0, censuses: 0 }; }
+}
+async function publishUptime(kind) {
+  const u = loadUptime();
+  u[kind] = (u[kind] || 0) + 1;
+  fs.mkdirSync(DATA, { recursive: true });
+  fs.writeFileSync(uptimeFile(), JSON.stringify(u));
+  const days = Math.max(0, Math.floor((Date.now() - Date.parse(u.since)) / 86400e3));
+  const line = [
+    "pulse-uptime-v1",
+    `agent:${cfg.agent}`,
+    `since:${u.since}`,
+    `days:${days}`,
+    `presences:${u.presences}`,
+    `censuses:${u.censuses}`,
+    cfg.github ? `src:https://github.com/${cfg.github}` : "",
+  ].filter(Boolean).join(" ");
+  const r = await setNote("pulse", "uptime", line);
+  console.log(`[uptime] ${r.line}`);
+}
 function memberIsLive(member) {
   const windowMs = (cfg.netWindowDays ?? 30) * 86400e3;
   return member && Date.now() - Date.parse(member.lastSeen) <= windowMs;
@@ -321,6 +348,8 @@ async function census(diff, rest) {
   console.log(`[census note] ${note.line}`);
   const hist = await setNote("pulse", "census-" + d.date, line);
   console.log(`[census hist] ${hist.line}`);
+  try { await publishUptime("censuses"); }
+  catch (e) { console.log(`[uptime] failed: ${e.message}`); }
   if (cfg.room) {
     try { await saySigned(cfg.room, line); }
     catch (e) { console.log(`[census announce] failed: ${e.message}`); }
@@ -342,6 +371,8 @@ async function presence() {
   // wait for the daily crawl; presence runs on the frequent cron.
   try { await processNet(); }
   catch (e) { console.log(`[net] failed: ${e.message}`); }
+  try { await publishUptime("presences"); }
+  catch (e) { console.log(`[uptime] failed: ${e.message}`); }
 }
 
 // ---- watch ----
